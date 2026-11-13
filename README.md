@@ -49,6 +49,30 @@ The command-line interface accepts a local HTML file or a URL:
 python -m readability -u https://example.com
 ```
 
+### Tracing extracted text back to the source page
+
+Pass `source_mapping=True` and call `summary_with_sources()` to get the
+summary HTML together with plain text and character-level source ranges. Each
+non-whitespace character of the plain text maps back, through a half-open
+interval, to an XPath plus `text`/`tail` slot and a Unicode offset in the
+parsed document before readability's own transformations:
+
+```python
+doc = Document(html, source_mapping=True)
+payload = doc.summary_with_sources()
+payload["html"]     # same HTML as doc.summary()
+payload["text"]     # whitespace-normalized plain text
+payload["sources"]  # [{"start": 0, "end": 5,
+                    #   "source": {"xpath": "/html/body/p[1]",
+                    #              "slot": "text", "offset": 0}}, ...]
+```
+
+Synthetic text (the `VIDEO` placeholder) is reported with `"source": null`.
+Enabling mapping never changes the selected summary and does not mutate a DOM
+passed in by the caller. The CLI exposes the same payload with
+`python -m readability --json page.html`. See
+[docs/source-mapping.md](docs/source-mapping.md) for the full format.
+
 Run the real-page extraction benchmark with the default minimum F1 of 0.95:
 
 ```bash

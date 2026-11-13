@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+import copy
+import json
 import logging
 import re
 import sys
@@ -21,6 +23,9 @@ from .htmls import get_title
 from .htmls import get_author
 from .htmls import shorten_title
 from .debug import describe, text_content
+from .sourcemap import NULL_TRACKER
+from .sourcemap import SourceTracker
+from .sourcemap import summary_payload
 
 
 log = logging.getLogger("readability.readability")
@@ -135,6 +140,7 @@ class Document:
         retry_length=250,
         xpath=False,
         handle_failures="discard",
+        source_mapping=False,
     ):
         """Generate the document
 
@@ -148,6 +154,12 @@ class Document:
         reconstruct selected summary in original document).
         :param handle_failures: Parameter passed to `lxml` for handling failure during exception.
         Support options = ["discard", "ignore", None]
+        :param source_mapping: If set to True, provenance of every summary
+        character is recorded against the parse tree produced before
+        readability's own transformations run. Use ``summary_with_sources()``
+        to obtain the summary HTML, plain text and character-level source
+        ranges. Enabling this option never changes the selected summary and
+        does not mutate a DOM passed in by the caller (it is deep-copied).
 
         Examples:
             positive_keywords=["news-item", "block"]
@@ -163,6 +175,7 @@ class Document:
         .short_title() -- cleaned up title
         .content() -- full content
         .summary() -- cleaned up content
+        .summary_with_sources() -- summary HTML, plain text and source ranges
         """
         self.input = input
         self.html = None
@@ -174,6 +187,8 @@ class Document:
         self.retry_length = retry_length
         self.xpath = xpath
         self.handle_failures = handle_failures
+        self.source_mapping = source_mapping
+        self.tracker = NULL_TRACKER
 
     def _html(self, force=False):
         if force or self.html is None:
@@ -183,11 +198,21 @@ class Document:
                 for i in self.html.getiterator():
                     # print root.getpath(i)
                     i.attrib["x"] = root.getpath(i)
+            if self.source_mapping:
+                # Baseline = parsed + initially cleaned tree, before any
+                # readability transformation. Rebuilt on every forced reparse
+                # (e.g. the lenient retry), which discards stale state.
+                self.tracker = SourceTracker(self.html)
+            else:
+                self.tracker = NULL_TRACKER
         return self.html
 
     def _parse(self, input):
         if isinstance(input, (_ElementTree, HtmlElement)):
-            doc = input
+            # Never mutate a DOM handed in by the caller. The deep copy is
+            # only needed for source mapping; keep the historical behaviour
+            # (shared DOM) when mapping is disabled.
+            doc = copy.deepcopy(input) if self.source_mapping else input
             self.encoding = 'utf-8'
         else:
             doc, self.encoding = build_doc(input)
@@ -258,7 +283,7 @@ class Document:
             while True:
                 self._html(True)
                 for i in self.tags(self.html, "script", "style", "noscript"):
-                    i.drop_tree()
+                    self._drop_tree(i)
                 for i in self.tags(self.html, "body"):
                     i.set("id", "readabilityBody")
                 if ruthless:
@@ -314,6 +339,54 @@ class Document:
         except Exception as e:
             log.exception("error getting summary: ")
             raise Unparseable(str(e)).with_traceback(sys.exc_info()[2])
+
+    def _drop_tree(self, elem):
+        """Drop an element while keeping the source tracker consistent.
+
+        Records lxml's tail migration before the element is removed so the
+        tail's characters keep their baseline origin.
+        """
+        self.tracker.drop(elem)
+        elem.drop_tree()
+
+    def summary_with_sources(self, html_partial=False, keep_all_images=False):
+        """Run :meth:`summary` and return summary content with source ranges.
+
+        Source mapping can be requested here even when the Document was not
+        constructed with ``source_mapping=True``; in that case the document
+        is re-parsed once so provenance starts from the baseline tree. The
+        returned dictionary has the shape::
+
+            {
+                "html": "<serialized summary HTML>",
+                "text": "plain text concatenation, whitespace normalized",
+                "sources": [
+                    {
+                        "start": 0,          # half-open offsets into "text"
+                        "end": 12,
+                        "source": {
+                            "xpath": "/html/body/div/p[1]",
+                            "slot": "text",  # or "tail"
+                            "offset": 0,     # Unicode offset in the slot
+                        },
+                    },
+                    {"start": 13, "end": 18, "source": None},  # synthetic
+                ],
+            }
+
+        Every non-whitespace character of ``text`` is covered by exactly one
+        range. ``source`` is ``None`` for text synthesized by the extractor
+        (it does not exist in the source document).
+        """
+        if not self.source_mapping:
+            self.source_mapping = True
+            # Force a baseline reparse so the tracker sees untransformed
+            # nodes even if summary() already mutated a previous tree.
+            self._html(force=True)
+        self.summary(
+            html_partial=html_partial, keep_all_images=keep_all_images
+        )
+        return summary_payload(self)
 
     def get_article(self, candidates, best_candidate, html_partial=False):
         # Now that we have the top candidate, look through its siblings for
@@ -788,7 +861,7 @@ class Document:
                 )
             ):
                 log.debug("Removing unlikely candidate - %s" % describe(elem))
-                elem.drop_tree()
+                self._drop_tree(elem)
 
     def transform_misused_divs_into_paragraphs(self):
         inline_tags = {
@@ -827,7 +900,10 @@ class Document:
             if elem.text and elem.text.strip():
                 p = fragment_fromstring("<p/>")
                 p.text = elem.text
+                # The new paragraph inherits the div's text provenance.
+                self.tracker.copy_slot(p, "text", elem, "text")
                 elem.text = None
+                self.tracker.clear_slot(elem, "text")
                 elem.insert(0, p)
                 paragraph = p
 
@@ -852,12 +928,15 @@ class Document:
                 if child.tail and child.tail.strip():
                     p = fragment_fromstring("<p/>")
                     p.text = child.tail
+                    # Migrating a tail into a new paragraph's text slot.
+                    self.tracker.copy_slot(p, "text", child, "tail")
                     child.tail = None
+                    self.tracker.clear_slot(child, "tail")
                     elem.insert(pos + 1, p)
                     # print "Inserted "+tounicode(p)+" to "+describe(elem)
                 if child.tag == "br":
                     # print 'Dropped <br> at '+describe(elem)
-                    child.drop_tree()
+                    self._drop_tree(child)
 
     def tags(self, node, *tag_names):
         for tag_name in tag_names:
@@ -908,24 +987,26 @@ class Document:
         MIN_LEN = self.min_text_length
         for header in self.tags(node, "h1", "h2", "h3", "h4", "h5", "h6"):
             if self.class_weight(header) < 0 or self.get_link_density(header) > 0.33:
-                header.drop_tree()
+                self._drop_tree(header)
 
         for elem in self.tags(node, "p"):
             if (
                 REGEXES["callToActionRe"].search(elem.text_content())
                 and self.get_link_density(elem) > 0.2
             ):
-                elem.drop_tree()
+                self._drop_tree(elem)
 
         for elem in self.tags(node, "form", "textarea"):
-            elem.drop_tree()
+            self._drop_tree(elem)
 
         for elem in self.tags(node, "iframe"):
             if "src" in elem.attrib and is_video_url(elem.attrib["src"]):
                 elem.attrib.pop("srcdoc", None)
                 elem.text = "VIDEO"  # ADD content to iframe text node to force <iframe></iframe> proper output
+                # "VIDEO" is invented by the extractor, not source text.
+                self.tracker.mark_synthetic(elem, "text")
             else:
-                elem.drop_tree()
+                self._drop_tree(elem)
 
         allowed = self.get_preserved_elements(node)
         # Conditionally clean <table>s, <ul>s, and <div>s
@@ -947,7 +1028,7 @@ class Document:
                     "Removed %s with score %6.3f and weight %-3s"
                     % (describe(el), content_score, weight,)
                 )
-                el.drop_tree()
+                self._drop_tree(el)
             elif el.text_content().count(",") < 10:
                 counts = {}
                 for kind in ["p", "img", "li", "a", "embed", "input"]:
@@ -1080,7 +1161,7 @@ class Document:
                     )
                     # print tounicode(el)
                     # log.debug("pname %s pweight %.3f" %(pname, pweight))
-                    el.drop_tree()
+                    self._drop_tree(el)
                 else:
                     log.debug(
                         "Not removing %s of length %s: %s"
@@ -1108,6 +1189,16 @@ def main():
         "-u", "--url", default=None, help="use URL instead of a local file"
     )
     parser.add_option("-x", "--xpath", default=None, help="add original xpath")
+    parser.add_option(
+        "-j",
+        "--json",
+        default=False,
+        action="store_true",
+        help=(
+            "emit JSON with summary html, plain text and character-level "
+            "source ranges (implies source mapping)"
+        ),
+    )
     parser.add_option(
         "-p",
         "--positive-keywords",
@@ -1148,12 +1239,18 @@ def main():
             url=options.url,
             positive_keywords=options.positive_keywords,
             negative_keywords=options.negative_keywords,
+            xpath=bool(options.xpath),
+            source_mapping=options.json,
         )
         if options.browser:
             from .browser import open_in_browser
 
             result = "<h2>" + doc.short_title() + "</h2><br/>" + doc.summary()
             open_in_browser(result)
+        elif options.json:
+            payload = doc.summary_with_sources()
+            payload["title"] = doc.short_title()
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
             result = "Title:" + doc.short_title() + "\n" + doc.summary()
             print(result)
